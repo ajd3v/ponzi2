@@ -11,6 +11,10 @@ import (
 )
 
 func TestDecodeStocks(t *testing.T) {
+	old := now
+	defer func() { now = old }()
+	now = func() time.Time { return time.Date(2018, time.October, 11, 0, 0, 0, 0, loc) }
+
 	for _, tt := range []struct {
 		desc    string
 		data    string
@@ -26,8 +30,8 @@ func TestDecodeStocks(t *testing.T) {
 					Quote: &Quote{
 						CompanyName:   "Sprott Physical Gold and Silver Trust Units",
 						LatestPrice:   11.71,
-						LatestSource:  "IEX real time price",
-						LatestTime:    "12:45:40 PM",
+						LatestSource:  SourceIEXRealTimePrice,
+						LatestTime:    time.Date(2018, time.October, 11, 12, 45, 40, 0, loc),
 						LatestUpdate:  time.Unix(1538153140, 524000000),
 						LatestVolume:  478088,
 						Open:          11.61,
@@ -49,8 +53,8 @@ func TestDecodeStocks(t *testing.T) {
 					Quote: &Quote{
 						CompanyName:   "Invesco DB USD Index Bullish Fund",
 						LatestPrice:   25.234,
-						LatestSource:  "15 minute delayed price",
-						LatestTime:    "12:32:11 PM",
+						LatestSource:  Source15MinuteDelayedPrice,
+						LatestTime:    time.Date(2018, time.October, 11, 12, 32, 11, 0, loc),
 						LatestUpdate:  time.Unix(1538152331, 455000000),
 						LatestVolume:  1000000,
 						Open:          25.3,
@@ -81,8 +85,8 @@ func TestDecodeStocks(t *testing.T) {
 					Quote: &Quote{
 						CompanyName:   "Apple Inc.",
 						LatestPrice:   225.74,
-						LatestSource:  "Close",
-						LatestTime:    "September 28, 2018",
+						LatestSource:  SourceClose,
+						LatestTime:    time.Date(2018, time.September, 28, 0, 0, 0, 0, loc),
 						LatestUpdate:  time.Unix(1538164800, 414000000),
 						LatestVolume:  22067409,
 						Open:          224.8,
@@ -139,8 +143,8 @@ func TestDecodeStocks(t *testing.T) {
 					Quote: &Quote{
 						CompanyName:   "Microsoft Corporation",
 						LatestPrice:   114.37,
-						LatestSource:  "Close",
-						LatestTime:    "September 28, 2018",
+						LatestSource:  SourceClose,
+						LatestTime:    time.Date(2018, time.September, 28, 0, 0, 0, 0, loc),
 						LatestUpdate:  time.Unix(1538164800, 600000000),
 						LatestVolume:  20491683,
 						Open:          114.17,
@@ -195,6 +199,55 @@ func TestDecodeStocks(t *testing.T) {
 
 			if diff := cmp.Diff(fmt.Sprint(tt.wantErr), fmt.Sprint(gotErr)); diff != "" {
 				t.Errorf("error differs:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestQuoteDate(t *testing.T) {
+	old := now
+	defer func() { now = old }()
+	now = func() time.Time { return time.Date(2018, time.October, 11, 0, 0, 0, 0, loc) }
+
+	for _, tt := range []struct {
+		desc              string
+		inputLatestSource Source
+		inputLatestTime   string
+		want              time.Time
+	}{
+		{
+			desc:              "IEX real time price",
+			inputLatestSource: SourceIEXRealTimePrice,
+			inputLatestTime:   "2:52:11 PM",
+			want:              time.Date(2018, time.October, 11, 14, 52, 11, 0, loc),
+		},
+		{
+			desc:              "15 minute delayed price",
+			inputLatestSource: Source15MinuteDelayedPrice,
+			inputLatestTime:   "12:32:11 PM",
+			want:              time.Date(2018, time.October, 11, 12, 32, 11, 0, loc),
+		},
+		{
+			desc:              "previous close",
+			inputLatestSource: SourcePreviousClose,
+			inputLatestTime:   "September 25, 2018",
+			want:              time.Date(2018, time.September, 25, 0, 0, 0, 0, loc),
+		},
+		{
+			desc:              "close",
+			inputLatestSource: SourceClose,
+			inputLatestTime:   "September 25, 2018",
+			want:              time.Date(2018, time.September, 25, 0, 0, 0, 0, loc),
+		},
+	} {
+		t.Run(tt.desc, func(t *testing.T) {
+			got, gotErr := quoteDate(tt.inputLatestSource, tt.inputLatestTime)
+			if gotErr != nil {
+				t.Fatalf("returned error (%v), want success", gotErr)
+			}
+
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("differs:\n%s", diff)
 			}
 		})
 	}

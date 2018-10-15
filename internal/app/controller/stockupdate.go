@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"fmt"
 	"sort"
+	"time"
 
 	"github.com/btmura/ponzi2/internal/app/model"
 	"github.com/btmura/ponzi2/internal/stock/iex"
@@ -16,9 +18,14 @@ const (
 	d = 3
 )
 
-func modelStockUpdate(st *iex.Stock) *model.StockUpdate {
-	ds := modelTradingSessions(st.Chart)
-	ws := modelTradingSessions(weeklyChartPoints(st.Chart))
+func modelStockUpdate(st *iex.Stock) (*model.StockUpdate, error) {
+	q, err := modelQuote(st.Quote)
+	if err != nil {
+		return nil, err
+	}
+
+	ds := modelTradingSessions(st)
+	ws := weeklyModelTradingSessions(ds)
 
 	m25 := modelMovingAverages(ds, 25)
 	m50 := modelMovingAverages(ds, 50)
@@ -67,24 +74,30 @@ func modelStockUpdate(st *iex.Stock) *model.StockUpdate {
 
 	return &model.StockUpdate{
 		Symbol: st.Symbol,
-		Quote:  modelQuote(st.Quote),
+		Quote:  q,
 		DailyTradingSessionSeries:   &model.TradingSessionSeries{TradingSessions: ds},
 		DailyMovingAverageSeries25:  &model.MovingAverageSeries{MovingAverages: m25},
 		DailyMovingAverageSeries50:  &model.MovingAverageSeries{MovingAverages: m50},
 		DailyMovingAverageSeries200: &model.MovingAverageSeries{MovingAverages: m200},
 		DailyStochasticSeries:       &model.StochasticSeries{Stochastics: dsto},
 		WeeklyStochasticSeries:      &model.StochasticSeries{Stochastics: wsto},
-	}
+	}, nil
 }
 
-func modelQuote(q *iex.Quote) *model.Quote {
+func modelQuote(q *iex.Quote) (*model.Quote, error) {
 	if q == nil {
-		return nil
+		return nil, nil
 	}
+
+	src, err := modelSource(q.LatestSource)
+	if err != nil {
+		return nil, err
+	}
+
 	return &model.Quote{
 		CompanyName:   q.CompanyName,
 		LatestPrice:   q.LatestPrice,
-		LatestSource:  q.LatestSource,
+		LatestSource:  src,
 		LatestTime:    q.LatestTime,
 		LatestUpdate:  q.LatestUpdate,
 		LatestVolume:  q.LatestVolume,
@@ -94,12 +107,29 @@ func modelQuote(q *iex.Quote) *model.Quote {
 		Close:         q.Close,
 		Change:        q.Change,
 		ChangePercent: q.ChangePercent,
+	}, nil
+}
+
+func modelSource(src iex.Source) (model.Source, error) {
+	switch src {
+	case iex.SourceUnspecified:
+		return model.SourceUnspecified, nil
+	case iex.SourceIEXRealTimePrice:
+		return model.SourceIEXRealTimePrice, nil
+	case iex.Source15MinuteDelayedPrice:
+		return model.Source15MinuteDelayedPrice, nil
+	case iex.SourceClose:
+		return model.SourceClose, nil
+	case iex.SourcePreviousClose:
+		return model.SourcePreviousClose, nil
+	default:
+		return 0, fmt.Errorf("unrecognized iex source: %v", src)
 	}
 }
 
-func modelTradingSessions(ps []*iex.ChartPoint) []*model.TradingSession {
+func modelTradingSessions(st *iex.Stock) []*model.TradingSession {
 	var ts []*model.TradingSession
-	for _, p := range ps {
+	for _, p := range st.Chart {
 		ts = append(ts, &model.TradingSession{
 			Date:          p.Date,
 			Open:          p.Open,
@@ -114,11 +144,43 @@ func modelTradingSessions(ps []*iex.ChartPoint) []*model.TradingSession {
 	sort.Slice(ts, func(i, j int) bool {
 		return ts[i].Date.Before(ts[j].Date)
 	})
-	return ts
+
+	// Add a trading session for the current quote if we do not have data
+	// for today's trading session, so that the chart includes the latest quote.
+
+	q := st.Quote
+	if q == nil {
+		return ts
+	}
+
+	t := &model.TradingSession{
+		Date:          q.LatestTime,
+		Open:          q.Open,
+		High:          q.High,
+		Low:           q.Low,
+		Close:         q.LatestPrice,
+		Volume:        q.LatestVolume,
+		Change:        q.Change,
+		PercentChange: q.ChangePercent,
+	}
+
+	if len(ts) == 0 {
+		return []*model.TradingSession{t}
+	}
+
+	clean := func(t time.Time) time.Time {
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+	}
+
+	if clean(t.Date) == clean(ts[len(ts)-1].Date) {
+		return ts
+	}
+
+	return append(ts, t)
 }
 
-func weeklyChartPoints(ps []*iex.ChartPoint) (ws []*iex.ChartPoint) {
-	for _, p := range ps {
+func weeklyModelTradingSessions(ds []*model.TradingSession) (ws []*model.TradingSession) {
+	for _, p := range ds {
 		diffWeek := ws == nil
 		if !diffWeek {
 			_, week := p.Date.ISOWeek()

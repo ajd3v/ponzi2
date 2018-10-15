@@ -4,6 +4,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/golang/glog"
 
@@ -15,11 +16,18 @@ import (
 
 // Controller runs the program in a "game loop".
 type Controller struct {
-	// iexClient fetches stock data.
-	iexClient *iex.Client
-
 	// model is the data that the Controller connects to the View.
 	model *model.Model
+
+	// iexClient fetches stock data to update the model.
+	iexClient *iex.Client
+
+	// pendingStockUpdates has stock updates ready to apply to the model.
+	// Go routines fetch data using iexClient and deposit them into this slice.
+	pendingStockUpdates struct {
+		updates []controllerStockUpdate
+		sync.Mutex
+	}
 
 	// view is the UI that the Controller updates.
 	view *view.View
@@ -29,9 +37,6 @@ type Controller struct {
 
 	// symbolToChartThumbMap maps symbol to ChartThumbnail.
 	symbolToChartThumbMap map[string]*view.ChartThumb
-
-	// pendingStockUpdates has stock updates ready to apply to the model.
-	pendingStockUpdates chan controllerStockUpdate
 
 	// enableSavingConfigs enables saving config changes.
 	enableSavingConfigs bool
@@ -43,34 +48,27 @@ type Controller struct {
 	doneSavingConfigs chan bool
 }
 
-// controllerStockUpdate bundles a stock and new data for that stock.
 type controllerStockUpdate struct {
-	// symbol is the stock's symbol.
-	symbol string
-
-	// update is the new data for the stock. Nil if an error happened.
-	update *model.StockUpdate
-
-	// updateErr is the error getting the update. Nil if no error happened.
+	symbol    string
+	update    *model.StockUpdate
 	updateErr error
 }
 
 // New creates a new Controller.
 func New(iexClient *iex.Client) *Controller {
 	return &Controller{
-		iexClient:             iexClient,
 		model:                 model.New(),
+		iexClient:             iexClient,
 		view:                  view.New(),
 		symbolToChartMap:      map[string]*view.Chart{},
 		symbolToChartThumbMap: map[string]*view.ChartThumb{},
-		pendingStockUpdates:   make(chan controllerStockUpdate),
 		pendingConfigSaves:    make(chan *config.Config),
 		doneSavingConfigs:     make(chan bool),
 	}
 }
 
-// Run initializes and runs the "game loop".
-func (c *Controller) Run() error {
+// RunLoop runs the loop until the user exits the app.
+func (c *Controller) RunLoop() error {
 	ctx := context.Background()
 
 	cleanup, err := c.view.Init(ctx)
@@ -112,7 +110,7 @@ func (c *Controller) Run() error {
 		c.setChart(ctx, symbol)
 	})
 
-	c.view.Run(c.update)
+	c.view.RunLoop(c.update)
 
 	// Disable config changes to start shutting down save processor.
 	c.enableSavingConfigs = false
@@ -123,38 +121,31 @@ func (c *Controller) Run() error {
 }
 
 func (c *Controller) update() {
-	// Process any stock updates.
-loop:
-	for {
-		select {
-		case u := <-c.pendingStockUpdates:
-			switch {
-			case u.update != nil:
-				st, updated := c.model.UpdateStock(u.update)
-				if !updated {
-					break loop
-				}
-				if ch, ok := c.symbolToChartMap[u.symbol]; ok {
-					ch.SetLoading(false)
-					ch.SetData(st)
-				}
-				if th, ok := c.symbolToChartThumbMap[u.symbol]; ok {
-					th.SetLoading(false)
-					th.SetData(st)
-				}
-
-			case u.updateErr != nil:
-				if ch, ok := c.symbolToChartMap[u.symbol]; ok {
-					ch.SetLoading(false)
-					ch.SetError(true)
-				}
-				if th, ok := c.symbolToChartThumbMap[u.symbol]; ok {
-					th.SetLoading(false)
-					th.SetError(true)
-				}
+	for _, u := range c.takePendingStockUpdatesLocked() {
+		switch {
+		case u.update != nil:
+			st, updated := c.model.UpdateStock(u.update)
+			if !updated {
+				continue
 			}
-		default:
-			break loop
+			if ch, ok := c.symbolToChartMap[u.symbol]; ok {
+				ch.SetLoading(false)
+				ch.SetData(st)
+			}
+			if th, ok := c.symbolToChartThumbMap[u.symbol]; ok {
+				th.SetLoading(false)
+				th.SetData(st)
+			}
+
+		case u.updateErr != nil:
+			if ch, ok := c.symbolToChartMap[u.symbol]; ok {
+				ch.SetLoading(false)
+				ch.SetError(true)
+			}
+			if th, ok := c.symbolToChartThumbMap[u.symbol]; ok {
+				th.SetLoading(false)
+				th.SetError(true)
+			}
 		}
 	}
 }
@@ -266,36 +257,65 @@ func (c *Controller) refreshStock(ctx context.Context, symbols []string) {
 		}
 		stocks, err := c.iexClient.GetStocks(ctx, req)
 		if err != nil {
+			var us []controllerStockUpdate
 			for _, s := range symbols {
-				c.pendingStockUpdates <- controllerStockUpdate{
+				us = append(us, controllerStockUpdate{
 					symbol:    s,
 					updateErr: err,
-				}
+				})
 			}
+			c.addPendingStockUpdatesLocked(us)
+			c.view.WakeLoop()
 			return
 		}
+
+		var us []controllerStockUpdate
 
 		found := map[string]bool{}
 		for _, st := range stocks {
 			found[st.Symbol] = true
-			c.pendingStockUpdates <- controllerStockUpdate{
-				symbol: st.Symbol,
-				update: modelStockUpdate(st),
-			}
+			u, err := modelStockUpdate(st)
+			us = append(us, controllerStockUpdate{
+				symbol:    st.Symbol,
+				update:    u,
+				updateErr: err,
+			})
 		}
 
 		for _, s := range symbols {
 			if found[s] {
 				continue
 			}
-			c.pendingStockUpdates <- controllerStockUpdate{
+			us = append(us, controllerStockUpdate{
 				symbol:    s,
 				updateErr: fmt.Errorf("no stock data for %q", s),
-			}
+			})
 		}
 
-		c.view.PostEmptyEvent()
+		c.addPendingStockUpdatesLocked(us)
+		c.view.WakeLoop()
 	}()
+}
+
+// addPendingStockUpdatesLocked locks the pendingStockUpdates slice,
+// adds the updates, and wakes up the view's update loop.
+func (c *Controller) addPendingStockUpdatesLocked(us []controllerStockUpdate) {
+	c.pendingStockUpdates.Lock()
+	c.pendingStockUpdates.updates = append(c.pendingStockUpdates.updates, us...)
+	c.pendingStockUpdates.Unlock()
+}
+
+// takePendingStockUpdatesLocked locks the pendingStockUpdates slice,
+// copies and empties the pendingStockUpdates, and returns the copied slice.
+func (c *Controller) takePendingStockUpdatesLocked() []controllerStockUpdate {
+	var us []controllerStockUpdate
+	c.pendingStockUpdates.Lock()
+	for _, u := range c.pendingStockUpdates.updates {
+		us = append(us, u)
+	}
+	c.pendingStockUpdates.updates = nil
+	c.pendingStockUpdates.Unlock()
+	return us
 }
 
 func (c *Controller) saveConfig() {

@@ -19,13 +19,16 @@ import (
 	"time"
 )
 
+// now is a function to get the current time. Mocked out in tests to return a fixed time.
+var now = time.Now
+
 // loc is the timezone to use when parsing dates.
 var loc = mustLoadLocation("America/New_York")
 
 // Range is the range to specify in the request.
 type Range string
 
-// ChartRange values.
+// Range values.
 const (
 	RangeOneDay   Range = "1d"
 	RangeTwoYears       = "2y"
@@ -49,8 +52,8 @@ type Stock struct {
 type Quote struct {
 	CompanyName   string
 	LatestPrice   float32
-	LatestSource  string
-	LatestTime    string
+	LatestSource  Source
+	LatestTime    time.Time
 	LatestUpdate  time.Time
 	LatestVolume  int
 	Open          float32
@@ -60,6 +63,19 @@ type Quote struct {
 	Change        float32
 	ChangePercent float32
 }
+
+// Source is the quote data source.
+type Source int
+
+// Source values.
+//go:generate stringer -type=Source
+const (
+	SourceUnspecified Source = iota
+	SourceIEXRealTimePrice
+	Source15MinuteDelayedPrice
+	SourceClose
+	SourcePreviousClose
+)
 
 // ChartPoint is a single point on the chart.
 type ChartPoint struct {
@@ -204,20 +220,30 @@ func decodeStocks(r io.Reader) ([]*Stock, error) {
 	for s, d := range m {
 		ch := &Stock{Symbol: s}
 
-		if d.Quote != nil {
+		if q := d.Quote; q != nil {
+			src, err := quoteSource(q.LatestSource)
+			if err != nil {
+				return nil, err
+			}
+
+			date, err := quoteDate(src, q.LatestTime)
+			if err != nil {
+				return nil, err
+			}
+
 			ch.Quote = &Quote{
-				CompanyName:   d.Quote.CompanyName,
-				LatestPrice:   float32(d.Quote.LatestPrice),
-				LatestSource:  d.Quote.LatestSource,
-				LatestTime:    d.Quote.LatestTime,
-				LatestUpdate:  millisToTime(d.Quote.LatestUpdate),
-				LatestVolume:  int(d.Quote.LatestVolume),
-				Open:          float32(d.Quote.Open),
-				High:          float32(d.Quote.High),
-				Low:           float32(d.Quote.Low),
-				Close:         float32(d.Quote.Close),
-				Change:        float32(d.Quote.Change),
-				ChangePercent: float32(d.Quote.ChangePercent),
+				CompanyName:   q.CompanyName,
+				LatestPrice:   float32(q.LatestPrice),
+				LatestSource:  src,
+				LatestTime:    date,
+				LatestUpdate:  millisToTime(q.LatestUpdate),
+				LatestVolume:  int(q.LatestVolume),
+				Open:          float32(q.Open),
+				High:          float32(q.High),
+				Low:           float32(q.Low),
+				Close:         float32(q.Close),
+				Change:        float32(q.Change),
+				ChangePercent: float32(q.ChangePercent),
 			}
 		}
 
@@ -245,6 +271,42 @@ func decodeStocks(r io.Reader) ([]*Stock, error) {
 	}
 
 	return chs, nil
+}
+
+func quoteSource(latestSource string) (Source, error) {
+	switch latestSource {
+	case "IEX real time price":
+		return SourceIEXRealTimePrice, nil
+	case "15 minute delayed price":
+		return Source15MinuteDelayedPrice, nil
+	case "Close":
+		return SourceClose, nil
+	case "Previous close":
+		return SourcePreviousClose, nil
+	default:
+		return SourceUnspecified, fmt.Errorf("unrecognized source: %q", latestSource)
+	}
+}
+
+func quoteDate(latestSource Source, latestTime string) (time.Time, error) {
+	switch latestSource {
+	case SourceIEXRealTimePrice, Source15MinuteDelayedPrice:
+		t, err := time.ParseInLocation("3:04:05 PM", latestTime, loc)
+		if err != nil {
+			return time.Time{}, err
+		}
+
+		n := now()
+		return time.Date(
+			n.Year(), n.Month(), n.Day(),
+			t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location()), nil
+
+	case SourcePreviousClose, SourceClose:
+		return time.ParseInLocation("January 2, 2006", latestTime, loc)
+
+	default:
+		return time.Time{}, fmt.Errorf("couldn't parse quote date with source(%q) and time(%q)", latestSource, latestTime)
+	}
 }
 
 func chartDate(date, minute string) (time.Time, error) {
